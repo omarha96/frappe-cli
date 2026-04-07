@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+CONFIG_DIR="$HOME/.frappe"
+PROFILES_FILE="$CONFIG_DIR/profiles"
+COOKIE_JAR="$CONFIG_DIR/cookies.txt"
+
+mkdir -p "$CONFIG_DIR"
+
+
+# ─────────────────────────────────────────────
+# COLORS
+# ─────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+print_green() { echo -e "${GREEN}$*${NC}"; }
+print_red()   { echo -e "${RED}$*${NC}"; }
+print_yellow(){ echo -e "${YELLOW}$*${NC}"; }
+
+
+# ─────────────────────────────────────────────
+# UTILS
+# ─────────────────────────────────────────────
+
+fail() { echo "ERROR: $*" >&2; exit 1; }
+
+log() { echo "[*] $*" >&2; }
+
+require_login() {
+  [[ -f "$COOKIE_JAR" ]] || fail "Not logged in. Run: frappe login"
+}
+
+parse_datetime() {
+  local raw="$1"
+  echo "${raw%%.*}"
+}
+
+to_epoch() {
+  date -d "$1" +%s 2>/dev/null || gdate -d "$1" +%s 2>/dev/null || echo 0
+}
+
+# ─────────────────────────────────────────────
+# PROFILE MANAGEMENT
+# ─────────────────────────────────────────────
+
+save_profile() {
+  local name="$1" host="$2" user="$3" pass="$4"
+  echo "${name}|${host}|${user}|${pass}" >> "$PROFILES_FILE"
+}
+
+select_profile() {
+  [[ -f "$PROFILES_FILE" ]] || return 1
+
+  echo "Available profiles:"
+  nl -w2 -s'. ' "$PROFILES_FILE" | cut -d'|' -f1
+
+  read -rp "Select profile number (or press Enter to skip): " idx
+  [[ -z "$idx" ]] && return 1
+
+  local line
+  line=$(sed -n "${idx}p" "$PROFILES_FILE")
+
+  FRAPPE_PROFILE_NAME="${line%%|*}"
+  rest="${line#*|}"
+  FRAPPE_HOST="${rest%%|*}"
+  rest="${rest#*|}"
+  FRAPPE_USERNAME="${rest%%|*}"
+  FRAPPE_PASSWORD="${rest#*|}"
+
+  echo "Using profile: $FRAPPE_PROFILE_NAME"
+  return 0
+}
+
+# ─────────────────────────────────────────────
+# LOGIN
+# ─────────────────────────────────────────────
+
+cmd_login() {
+  rm -f "$COOKIE_JAR"
+
+  if ! select_profile; then
+    read -rp "Host: " FRAPPE_HOST
+    read -rp "User: " FRAPPE_USERNAME
+    read -rsp "Password: " FRAPPE_PASSWORD
+    echo
+
+    read -rp "Save as profile? (y/N): " save
+    if [[ "$save" =~ ^[Yy]$ ]]; then
+      read -rp "Profile name: " name
+      save_profile "$name" "$FRAPPE_HOST" "$FRAPPE_USERNAME" "$FRAPPE_PASSWORD"
+    fi
+  fi
+
+  log "Logging in..."
+
+  local response
+  response=$(curl -s -X POST \
+    "$FRAPPE_HOST/login" \
+    -c "$COOKIE_JAR" \
+    --data-urlencode "usr=$FRAPPE_USERNAME" \
+    --data-urlencode "pwd=$FRAPPE_PASSWORD" \
+    --data-urlencode "cmd=login")
+
+  local user
+  user=$(echo "$response" | jq -r '.full_name // empty')
+
+  [[ -z "$user" ]] && fail "Login failed"
+
+  log "Logged in as $user"
+}
+
+# ─────────────────────────────────────────────
+# LOGOUT
+# ─────────────────────────────────────────────
+
+cmd_logout() {
+  rm -f "$COOKIE_JAR"
+  echo "Logged out."
+}
+
+# ─────────────────────────────────────────────
+# REQUEST
+# ─────────────────────────────────────────────
+
+frappe_request() {
+  require_login
+
+  local endpoint="$1"
+  shift
+
+  curl -s \
+    -b "$COOKIE_JAR" \
+    -c "$COOKIE_JAR" \
+    "$endpoint" "$@"
+}
+
+get_current_state() {
+  local res
+  res=$(frappe_request \
+    "$FRAPPE_HOST/api/resource/Employee%20Checkin" \
+    -G \
+    --data-urlencode 'fields=["log_type","creation"]' \
+    --data-urlencode "order_by=creation desc" \
+    --data-urlencode "limit_page_length=1"
+  )
+
+  echo "$res" | jq -r '.data[0].log_type // empty'
+}
+
+# ─────────────────────────────────────────────
+# CHECKINS
+# ─────────────────────────────────────────────
+
+cmd_get_checking_records() {
+  require_login
+
+  local limit="${1:-10}"
+
+  local res
+  res=$(frappe_request \
+    "$FRAPPE_HOST/api/resource/Employee%20Checkin" \
+    -G \
+    --data-urlencode 'fields=["log_type","creation"]' \
+    --data-urlencode "order_by=creation desc" \
+    --data-urlencode "limit_page_length=$limit"
+  )
+
+  echo "$res" | jq -r '.data[] | "\(.log_type) \(.creation)"'
+}
+
+# ─────────────────────────────────────────────
+# DO CHECKIN / CHECKOUT
+# ─────────────────────────────────────────────
+
+do_log() {
+  local type="$1"
+
+  require_login
+
+  log "Sending $type..."
+
+  local res
+  res=$(frappe_request \
+    "$FRAPPE_HOST/api/method/erpnext.hr.doctype.employee_checkin.employee_checkin.add_log_based_on_employee_field" \
+    -X POST \
+    --data-urlencode "log_type=$type"
+  )
+
+  echo "$res" | jq .
+}
+
+cmd_get_checking_state() {
+  require_login
+
+  local state
+  state=$(get_current_state)
+
+  case "$state" in
+    IN)
+      print_green "IN  (currently checked in)"
+      ;;
+    OUT)
+      print_red "OUT (currently checked out)"
+      ;;
+    *)
+      print_yellow "UNKNOWN (no records found)"
+      ;;
+  esac
+}
+
+cmd_checkout() {
+  require_login
+
+  local state
+  state=$(get_current_state)
+
+  if [[ "$state" == "OUT" ]]; then
+    print_yellow "⚠ Already checked out"
+    return 0
+  fi
+
+  if [[ -z "$state" ]]; then
+    print_red "✗ Cannot checkout: no prior check-in"
+    return 1
+  fi
+
+  do_log "OUT" | jq . && print_green "✓ Check-out recorded"
+}
+
+cmd_checkout() {
+  require_login
+
+  local state
+  state=$(get_current_state)
+
+  if [[ "$state" == "OUT" ]]; then
+    print_yellow "⚠ Already checked out"
+    return 0
+  fi
+
+  if [[ -z "$state" ]]; then
+    print_red "✗ Cannot checkout: no prior check-in"
+    return 1
+  fi
+
+  do_log "OUT" | jq . && print_green "✓ Check-out recorded"
+}
+
+# ─────────────────────────────────────────────
+# HOURS
+# ─────────────────────────────────────────────
+
+cmd_get_hours() {
+  require_login
+
+  local res
+  res=$(frappe_request \
+    "$FRAPPE_HOST/api/resource/Employee%20Checkin" \
+    -G \
+    --data-urlencode 'fields=["log_type","creation"]' \
+    --data-urlencode "order_by=creation desc" \
+    --data-urlencode "limit_page_length=50"
+  )
+
+  local entries
+  entries=$(echo "$res" | jq -r '.data[] | "\(.log_type)|\(.creation)"')
+
+  local last_out=""
+  local total=0
+
+  while IFS="|" read -r type dt; do
+    dt="${dt%%.*}"
+
+    if [[ "$type" == "OUT" ]]; then
+      last_out="$dt"
+    elif [[ "$type" == "IN" && -n "$last_out" ]]; then
+      diff=$(( $(to_epoch "$last_out") - $(to_epoch "$dt") ))
+      total=$(( total + diff ))
+      last_out=""
+    fi
+  done <<< "$entries"
+
+  printf "Total: %02dh %02dm %02ds\n" \
+    $(( total / 3600 )) \
+    $(( (total % 3600) / 60 )) \
+    $(( total % 60 ))
+}
+
+# ─────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────
+
+case "${1:-}" in
+  login) shift; cmd_login "$@" ;;
+  logout) cmd_logout ;;
+
+  get-checking-records) shift; cmd_get_checking_records "$@" ;;
+  get-checking-state) cmd_get_checking_state ;;
+  get-hours) cmd_get_hours ;;
+
+  do-checkin) cmd_checkin ;;
+  do-checkout) cmd_checkout ;;
+
+  *)
+    cat <<EOF
+Commands:
+  frappe login
+  frappe logout
+
+  frappe get-checking-records [limit]
+  frappe get-checking-state
+  frappe get-hours
+
+  frappe do-checkin
+  frappe do-checkout
+EOF
+    ;;
+esac
