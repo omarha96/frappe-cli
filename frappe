@@ -24,8 +24,7 @@ if [[ -f "$SESSION_FILE" ]]; then
 fi
 
 save_session() {
-  printf '%s\n%s\n%s\n' "$FRAPPE_HOST" "$FRAPPE_USERNAME" "$FRAPPE_PASSWORD" > "$SESSION_FILE"
-  chmod 600 "$SESSION_FILE"
+  (umask 077; printf '%s\n%s\n%s\n' "$FRAPPE_HOST" "$FRAPPE_USERNAME" "$FRAPPE_PASSWORD" > "$SESSION_FILE")
 }
 
 
@@ -194,8 +193,8 @@ frappe_request() {
     fi
 
     if (( attempt < 3 )); then
-      log "Session expired, re-logging in (retry $attempt/2)..."
-      _do_login || log "Re-login retry $attempt failed, retrying..."
+      log "Session expired, re-logging in (attempt $attempt/3)..."
+      _do_login || log "Re-login attempt $attempt failed, retrying..."
     fi
   done
 
@@ -351,15 +350,15 @@ cmd_get_hours() {
     return 0
   fi
 
-  # Group seconds by date (input sorted → insertion order preserved) then print
+  # Sort pairs by date, then aggregate seconds per date and print totals
   printf '%s' "$pairs" | sort | awk '
     { sum[$1] += $2; grand += $2; if (!seen[$1]++) dates[++n] = $1 }
     END {
       for (i = 1; i <= n; i++) {
         d = dates[i]
-        printf "%s  \342\206\222  %02dh %02dm\n", d, sum[d]/3600, (sum[d]%3600)/60
+        printf "%s  →  %02dh %02dm\n", d, sum[d]/3600, (sum[d]%3600)/60
       }
-      print "\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200"
+      print "──────────────────────────"
       printf "Total:  %02dh %02dm\n", grand/3600, (grand%3600)/60
     }
   '
