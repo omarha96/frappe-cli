@@ -6,6 +6,7 @@ CONFIG_DIR="$HOME/.frappe"
 PROFILES_FILE="$CONFIG_DIR/profiles"
 COOKIE_JAR="$CONFIG_DIR/cookies.txt"
 SESSION_FILE="$CONFIG_DIR/session"
+DEFAULT_PROFILE_FILE="$CONFIG_DIR/default_profile"
 
 mkdir -p "$CONFIG_DIR"
 
@@ -16,6 +17,7 @@ mkdir -p "$CONFIG_DIR"
 FRAPPE_HOST=""
 FRAPPE_USERNAME=""
 FRAPPE_PASSWORD=""
+FRAPPE_PROFILE_NAME=""
 
 if [[ -f "$SESSION_FILE" ]]; then
   FRAPPE_HOST=$(sed -n '1p' "$SESSION_FILE")
@@ -70,21 +72,27 @@ to_epoch() {
 
 save_profile() {
   local name="$1" host="$2" user="$3" pass="$4"
-  echo "${name}|${host}|${user}|${pass}" >> "$PROFILES_FILE"
+  # Remove any existing entry with the same name before appending
+  if [[ -f "$PROFILES_FILE" ]]; then
+    local existing
+    existing=$(awk -F'|' -v n="$name" '$1 != n' "$PROFILES_FILE")
+    printf '%s\n' "$existing" > "$PROFILES_FILE"
+  fi
+  printf '%s|%s|%s|%s\n' "$name" "$host" "$user" "$pass" >> "$PROFILES_FILE"
 }
 
-select_profile() {
-  [[ -f "$PROFILES_FILE" ]] || return 1
+set_default_profile() {
+  printf '%s\n' "$1" > "$DEFAULT_PROFILE_FILE"
+}
 
-  echo "Available profiles:"
-  nl -w2 -s'. ' "$PROFILES_FILE" | awk -F'|' '{print $1 " (" $2 ")"}'
+load_default_profile() {
+  [[ -f "$DEFAULT_PROFILE_FILE" ]] || return 1
+  [[ -f "$PROFILES_FILE" ]]        || return 1
 
-  read -rp "Select profile number (or press Enter to skip): " idx
-  [[ -z "$idx" ]] && return 1
-
-  local line
-  line=$(sed -n "${idx}p" "$PROFILES_FILE")
-  [[ -z "$line" ]] && { echo "Invalid selection."; return 1; }
+  local default_name line
+  default_name=$(cat "$DEFAULT_PROFILE_FILE")
+  line=$(awk -F'|' -v n="$default_name" '$1 == n { print; exit }' "$PROFILES_FILE")
+  [[ -z "$line" ]] && return 1
 
   FRAPPE_PROFILE_NAME="${line%%|*}"
   local rest="${line#*|}"
@@ -92,8 +100,6 @@ select_profile() {
   rest="${rest#*|}"
   FRAPPE_USERNAME="${rest%%|*}"
   FRAPPE_PASSWORD="${rest#*|}"
-
-  echo "Using profile: $FRAPPE_PROFILE_NAME ($FRAPPE_HOST)"
   return 0
 }
 
@@ -118,20 +124,46 @@ _do_login() {
 }
 
 cmd_login() {
+  local flag="${1:-}"
   rm -f "$COOKIE_JAR"
 
-  if ! select_profile; then
-    read -rp "Host: " FRAPPE_HOST
-    read -rp "User: " FRAPPE_USERNAME
-    read -rsp "Password: " FRAPPE_PASSWORD
-    echo
-
-    read -rp "Save as profile? (y/N): " save
-    if [[ "$save" =~ ^[Yy]$ ]]; then
-      read -rp "Profile name: " name
-      save_profile "$name" "$FRAPPE_HOST" "$FRAPPE_USERNAME" "$FRAPPE_PASSWORD"
-    fi
-  fi
+  case "$flag" in
+    --guest)
+      # Prompt for credentials but do not persist them
+      read -rp "Host: " FRAPPE_HOST
+      read -rp "User: " FRAPPE_USERNAME
+      read -rsp "Password: " FRAPPE_PASSWORD
+      echo
+      ;;
+    --new)
+      # Prompt for brand-new credentials, save as new default profile
+      read -rp "Host: " FRAPPE_HOST
+      read -rp "User: " FRAPPE_USERNAME
+      read -rsp "Password: " FRAPPE_PASSWORD
+      echo
+      read -rp "Profile name [default]: " FRAPPE_PROFILE_NAME
+      FRAPPE_PROFILE_NAME="${FRAPPE_PROFILE_NAME:-default}"
+      save_profile "$FRAPPE_PROFILE_NAME" "$FRAPPE_HOST" "$FRAPPE_USERNAME" "$FRAPPE_PASSWORD"
+      set_default_profile "$FRAPPE_PROFILE_NAME"
+      log "Saved as profile '$FRAPPE_PROFILE_NAME'"
+      ;;
+    *)
+      if load_default_profile; then
+        log "Using profile '$FRAPPE_PROFILE_NAME' ($FRAPPE_HOST)"
+      else
+        # First-time setup: prompt and auto-save as default profile
+        read -rp "Host: " FRAPPE_HOST
+        read -rp "User: " FRAPPE_USERNAME
+        read -rsp "Password: " FRAPPE_PASSWORD
+        echo
+        read -rp "Profile name [default]: " FRAPPE_PROFILE_NAME
+        FRAPPE_PROFILE_NAME="${FRAPPE_PROFILE_NAME:-default}"
+        save_profile "$FRAPPE_PROFILE_NAME" "$FRAPPE_HOST" "$FRAPPE_USERNAME" "$FRAPPE_PASSWORD"
+        set_default_profile "$FRAPPE_PROFILE_NAME"
+        log "Saved as profile '$FRAPPE_PROFILE_NAME'"
+      fi
+      ;;
+  esac
 
   log "Logging in..."
 
@@ -157,7 +189,7 @@ cmd_login() {
 # ─────────────────────────────────────────────
 
 cmd_logout() {
-  rm -f "$COOKIE_JAR" "$SESSION_FILE"
+  rm -f "$COOKIE_JAR" "$SESSION_FILE" "$DEFAULT_PROFILE_FILE"
   echo "Logged out."
 }
 
@@ -256,18 +288,66 @@ do_log() {
   echo "$res" | jq .
 }
 
+get_today_duration() {
+  local today
+  today=$(date +%Y-%m-%d)
+
+  local res
+  res=$(frappe_request \
+    "$FRAPPE_HOST/api/resource/Employee%20Checkin" \
+    -G \
+    --data-urlencode 'fields=["log_type","creation"]' \
+    --data-urlencode "order_by=creation asc" \
+    --data-urlencode "limit_page_length=50"
+  )
+
+  local entries
+  entries=$(echo "$res" | jq -r --arg today "$today" \
+    '.data[] | select(.creation | startswith($today)) | "\(.log_type)|\(.creation)"')
+
+  local last_in="" total=0 type dt diff
+
+  while IFS="|" read -r type dt; do
+    dt="${dt%%.*}"
+    if [[ "$type" == "IN" ]]; then
+      last_in="$dt"
+    elif [[ "$type" == "OUT" && -n "$last_in" ]]; then
+      diff=$(( $(to_epoch "$dt") - $(to_epoch "$last_in") ))
+      total=$(( total + diff ))
+      last_in=""
+    fi
+  done <<< "$entries"
+
+  echo "$total"
+}
+
 cmd_get_checking_state() {
   require_login
 
-  local state
-  state=$(get_current_state)
+  local res
+  res=$(frappe_request \
+    "$FRAPPE_HOST/api/resource/Employee%20Checkin" \
+    -G \
+    --data-urlencode 'fields=["log_type","creation"]' \
+    --data-urlencode "order_by=creation desc" \
+    --data-urlencode "limit_page_length=1"
+  )
+
+  local state ts
+  state=$(echo "$res" | jq -r '.data[0].log_type // empty')
+  ts=$(echo "$res" | jq -r '.data[0].creation // empty')
+  ts="${ts%%.*}"
 
   case "$state" in
     IN)
-      print_green "IN  (currently checked in)"
+      local elapsed
+      elapsed=$(( $(date +%s) - $(to_epoch "$ts") ))
+      print_green "IN  — checked in for $(printf '%02dh %02dm' $(( elapsed / 3600 )) $(( (elapsed % 3600) / 60 )))"
       ;;
     OUT)
-      print_red "OUT (currently checked out)"
+      local today_secs
+      today_secs=$(get_today_duration)
+      print_red "OUT — worked $(printf '%02dh %02dm' $(( today_secs / 3600 )) $(( (today_secs % 3600) / 60 ))) today"
       ;;
     *)
       print_yellow "UNKNOWN (no records found)"
@@ -383,7 +463,9 @@ case "${1:-}" in
   *)
     cat <<EOF
 Commands:
-  frappe login
+  frappe login           # use saved default profile (or first-time setup)
+  frappe login --new     # enter new credentials and save as new default
+  frappe login --guest   # one-off login, nothing saved
   frappe logout
 
   frappe get-checking-records [limit]
