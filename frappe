@@ -5,8 +5,28 @@ set -uo pipefail
 CONFIG_DIR="$HOME/.frappe"
 PROFILES_FILE="$CONFIG_DIR/profiles"
 COOKIE_JAR="$CONFIG_DIR/cookies.txt"
+SESSION_FILE="$CONFIG_DIR/session"
 
 mkdir -p "$CONFIG_DIR"
+
+# ─────────────────────────────────────────────
+# SESSION PERSISTENCE (keeps FRAPPE_HOST etc. across invocations)
+# ─────────────────────────────────────────────
+
+FRAPPE_HOST=""
+FRAPPE_USERNAME=""
+FRAPPE_PASSWORD=""
+
+if [[ -f "$SESSION_FILE" ]]; then
+  FRAPPE_HOST=$(sed -n '1p' "$SESSION_FILE")
+  FRAPPE_USERNAME=$(sed -n '2p' "$SESSION_FILE")
+  FRAPPE_PASSWORD=$(sed -n '3p' "$SESSION_FILE")
+fi
+
+save_session() {
+  printf '%s\n%s\n%s\n' "$FRAPPE_HOST" "$FRAPPE_USERNAME" "$FRAPPE_PASSWORD" > "$SESSION_FILE"
+  chmod 600 "$SESSION_FILE"
+}
 
 
 # ─────────────────────────────────────────────
@@ -33,6 +53,7 @@ log() { echo "[*] $*" >&2; }
 
 require_login() {
   [[ -f "$COOKIE_JAR" ]] || fail "Not logged in. Run: frappe login"
+  [[ -n "$FRAPPE_HOST" ]] || fail "Host not configured. Run: frappe login"
 }
 
 parse_datetime() {
@@ -57,28 +78,45 @@ select_profile() {
   [[ -f "$PROFILES_FILE" ]] || return 1
 
   echo "Available profiles:"
-  nl -w2 -s'. ' "$PROFILES_FILE" | cut -d'|' -f1
+  nl -w2 -s'. ' "$PROFILES_FILE" | awk -F'|' '{print $1 " (" $2 ")"}'
 
   read -rp "Select profile number (or press Enter to skip): " idx
   [[ -z "$idx" ]] && return 1
 
   local line
   line=$(sed -n "${idx}p" "$PROFILES_FILE")
+  [[ -z "$line" ]] && { echo "Invalid selection."; return 1; }
 
   FRAPPE_PROFILE_NAME="${line%%|*}"
-  rest="${line#*|}"
+  local rest="${line#*|}"
   FRAPPE_HOST="${rest%%|*}"
   rest="${rest#*|}"
   FRAPPE_USERNAME="${rest%%|*}"
   FRAPPE_PASSWORD="${rest#*|}"
 
-  echo "Using profile: $FRAPPE_PROFILE_NAME"
+  echo "Using profile: $FRAPPE_PROFILE_NAME ($FRAPPE_HOST)"
   return 0
 }
 
 # ─────────────────────────────────────────────
 # LOGIN
 # ─────────────────────────────────────────────
+
+# Internal: re-authenticate using stored credentials (no prompts).
+_do_login() {
+  [[ -n "$FRAPPE_HOST" && -n "$FRAPPE_USERNAME" && -n "$FRAPPE_PASSWORD" ]] || return 1
+
+  local response user
+  response=$(curl -s -X POST \
+    "$FRAPPE_HOST/login" \
+    -c "$COOKIE_JAR" \
+    --data-urlencode "usr=$FRAPPE_USERNAME" \
+    --data-urlencode "pwd=$FRAPPE_PASSWORD" \
+    --data-urlencode "cmd=login")
+
+  user=$(echo "$response" | jq -r '.full_name // empty')
+  [[ -n "$user" ]]
+}
 
 cmd_login() {
   rm -f "$COOKIE_JAR"
@@ -111,6 +149,7 @@ cmd_login() {
 
   [[ -z "$user" ]] && fail "Login failed"
 
+  save_session
   log "Logged in as $user"
 }
 
@@ -119,7 +158,7 @@ cmd_login() {
 # ─────────────────────────────────────────────
 
 cmd_logout() {
-  rm -f "$COOKIE_JAR"
+  rm -f "$COOKIE_JAR" "$SESSION_FILE"
   echo "Logged out."
 }
 
@@ -127,16 +166,40 @@ cmd_logout() {
 # REQUEST
 # ─────────────────────────────────────────────
 
+# Returns 0 (true) when the response indicates an expired/invalid session.
+_is_auth_error() {
+  local response="$1"
+  echo "$response" | jq -e \
+    '(.exc_type? == "AuthenticationError") or
+     (.message? // "" | ascii_downcase | test("not permitted|session.*expired"))' \
+    > /dev/null 2>&1
+}
+
 frappe_request() {
   require_login
 
   local endpoint="$1"
   shift
 
-  curl -s \
-    -b "$COOKIE_JAR" \
-    -c "$COOKIE_JAR" \
-    "$endpoint" "$@"
+  local attempt response
+  for (( attempt = 1; attempt <= 3; attempt++ )); do
+    response=$(curl -s \
+      -b "$COOKIE_JAR" \
+      -c "$COOKIE_JAR" \
+      "$endpoint" "$@")
+
+    if ! _is_auth_error "$response"; then
+      echo "$response"
+      return 0
+    fi
+
+    if (( attempt < 3 )); then
+      log "Session expired, re-logging in (retry $attempt/2)..."
+      _do_login || log "Re-login retry $attempt failed, retrying..."
+    fi
+  done
+
+  fail "Session expired after 3 attempts. Please run: frappe login"
 }
 
 get_current_state() {
@@ -159,7 +222,7 @@ get_current_state() {
 cmd_get_checking_records() {
   require_login
 
-  local limit="${1:-10}"
+  local limit="${1:-8}"
 
   local res
   res=$(frappe_request \
@@ -213,23 +276,18 @@ cmd_get_checking_state() {
   esac
 }
 
-cmd_checkout() {
+cmd_checkin() {
   require_login
 
   local state
   state=$(get_current_state)
 
-  if [[ "$state" == "OUT" ]]; then
-    print_yellow "⚠ Already checked out"
+  if [[ "$state" == "IN" ]]; then
+    print_yellow "⚠ Already checked in"
     return 0
   fi
 
-  if [[ -z "$state" ]]; then
-    print_red "✗ Cannot checkout: no prior check-in"
-    return 1
-  fi
-
-  do_log "OUT" | jq . && print_green "✓ Check-out recorded"
+  do_log "IN" && print_green "✓ Check-in recorded"
 }
 
 cmd_checkout() {
@@ -248,7 +306,7 @@ cmd_checkout() {
     return 1
   fi
 
-  do_log "OUT" | jq . && print_green "✓ Check-out recorded"
+  do_log "OUT" && print_green "✓ Check-out recorded"
 }
 
 # ─────────────────────────────────────────────
@@ -263,32 +321,48 @@ cmd_get_hours() {
     "$FRAPPE_HOST/api/resource/Employee%20Checkin" \
     -G \
     --data-urlencode 'fields=["log_type","creation"]' \
-    --data-urlencode "order_by=creation desc" \
+    --data-urlencode "order_by=creation asc" \
     --data-urlencode "limit_page_length=50"
   )
 
   local entries
   entries=$(echo "$res" | jq -r '.data[] | "\(.log_type)|\(.creation)"')
 
-  local last_out=""
-  local total=0
+  local last_in="" last_in_date="" pairs="" dt date diff use_date
 
   while IFS="|" read -r type dt; do
     dt="${dt%%.*}"
+    date="${dt%% *}"
 
-    if [[ "$type" == "OUT" ]]; then
-      last_out="$dt"
-    elif [[ "$type" == "IN" && -n "$last_out" ]]; then
-      diff=$(( $(to_epoch "$last_out") - $(to_epoch "$dt") ))
-      total=$(( total + diff ))
-      last_out=""
+    if [[ "$type" == "IN" ]]; then
+      last_in="$dt"
+      last_in_date="$date"
+    elif [[ "$type" == "OUT" && -n "$last_in" ]]; then
+      diff=$(( $(to_epoch "$dt") - $(to_epoch "$last_in") ))
+      use_date="${last_in_date:-$date}"
+      pairs+="${use_date} ${diff}"$'\n'
+      last_in=""
+      last_in_date=""
     fi
   done <<< "$entries"
 
-  printf "Total: %02dh %02dm %02ds\n" \
-    $(( total / 3600 )) \
-    $(( (total % 3600) / 60 )) \
-    $(( total % 60 ))
+  if [[ -z "$pairs" ]]; then
+    print_yellow "No check-in/out pairs found."
+    return 0
+  fi
+
+  # Group seconds by date (input sorted → insertion order preserved) then print
+  printf '%s' "$pairs" | sort | awk '
+    { sum[$1] += $2; grand += $2; if (!seen[$1]++) dates[++n] = $1 }
+    END {
+      for (i = 1; i <= n; i++) {
+        d = dates[i]
+        printf "%s  \342\206\222  %02dh %02dm\n", d, sum[d]/3600, (sum[d]%3600)/60
+      }
+      print "\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200"
+      printf "Total:  %02dh %02dm\n", grand/3600, (grand%3600)/60
+    }
+  '
 }
 
 # ─────────────────────────────────────────────
