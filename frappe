@@ -66,6 +66,11 @@ to_epoch() {
   date -d "$1" +%s 2>/dev/null || gdate -d "$1" +%s 2>/dev/null || echo 0
 }
 
+format_duration() {
+  local secs="$1"
+  printf '%02dh %02dm' $(( secs / 3600 )) $(( (secs % 3600) / 60 ))
+}
+
 # ─────────────────────────────────────────────
 # PROFILE MANAGEMENT
 # ─────────────────────────────────────────────
@@ -74,9 +79,8 @@ save_profile() {
   local name="$1" host="$2" user="$3" pass="$4"
   # Remove any existing entry with the same name before appending
   if [[ -f "$PROFILES_FILE" ]]; then
-    local existing
-    existing=$(awk -F'|' -v n="$name" '$1 != n' "$PROFILES_FILE")
-    printf '%s\n' "$existing" > "$PROFILES_FILE"
+    awk -F'|' -v n="$name" '$1 != n' "$PROFILES_FILE" > "${PROFILES_FILE}.tmp"
+    mv "${PROFILES_FILE}.tmp" "$PROFILES_FILE"
   fi
   printf '%s|%s|%s|%s\n' "$name" "$host" "$user" "$pass" >> "$PROFILES_FILE"
 }
@@ -189,7 +193,7 @@ cmd_login() {
 # ─────────────────────────────────────────────
 
 cmd_logout() {
-  rm -f "$COOKIE_JAR" "$SESSION_FILE" "$DEFAULT_PROFILE_FILE"
+  rm -f "$COOKIE_JAR" "$SESSION_FILE"
   echo "Logged out."
 }
 
@@ -342,12 +346,12 @@ cmd_get_checking_state() {
     IN)
       local elapsed
       elapsed=$(( $(date +%s) - $(to_epoch "$ts") ))
-      print_green "IN  — checked in for $(printf '%02dh %02dm' $(( elapsed / 3600 )) $(( (elapsed % 3600) / 60 )))"
+      print_green "IN  — checked in for $(format_duration $elapsed)"
       ;;
     OUT)
       local today_secs
       today_secs=$(get_today_duration)
-      print_red "OUT — worked $(printf '%02dh %02dm' $(( today_secs / 3600 )) $(( (today_secs % 3600) / 60 ))) today"
+      print_red "OUT — worked $(format_duration $today_secs) today"
       ;;
     *)
       print_yellow "UNKNOWN (no records found)"
