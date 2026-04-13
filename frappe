@@ -315,33 +315,34 @@ cmd_checkout() {
 cmd_get_hours() {
   require_login
 
+  local limit="${1:-8}"
   local res
   res=$(frappe_request \
     "$FRAPPE_HOST/api/resource/Employee%20Checkin" \
     -G \
     --data-urlencode 'fields=["log_type","creation"]' \
-    --data-urlencode "order_by=creation asc" \
-    --data-urlencode "limit_page_length=50"
+    --data-urlencode "order_by=creation desc" \
+    --data-urlencode "limit_page_length=$limit" 
   )
 
   local entries
   entries=$(echo "$res" | jq -r '.data[] | "\(.log_type)|\(.creation)"')
-
-  local last_in="" last_in_date="" pairs="" dt date diff use_date
+  
+  local last_out="" last_out_date="" pairs="" dt date diff use_date
 
   while IFS="|" read -r type dt; do
     dt="${dt%%.*}"
     date="${dt%% *}"
 
-    if [[ "$type" == "IN" ]]; then
-      last_in="$dt"
-      last_in_date="$date"
-    elif [[ "$type" == "OUT" && -n "$last_in" ]]; then
-      diff=$(( $(to_epoch "$dt") - $(to_epoch "$last_in") ))
-      use_date="${last_in_date:-$date}"
+    if [[ "$type" == "OUT" ]]; then
+      last_out="$dt"
+      last_out_date="$date"
+    elif [[ "$type" == "IN" && -n "$last_out" ]]; then
+      diff=$(( - $(to_epoch "$dt") + $(to_epoch "$last_out") ))
+      use_date="${last_out_date:-$date}"
       pairs+="${use_date} ${diff}"$'\n'
-      last_in=""
-      last_in_date=""
+      last_out=""
+      last_out_date=""
     fi
   done <<< "$entries"
 
@@ -351,7 +352,7 @@ cmd_get_hours() {
   fi
 
   # Sort pairs by date, then aggregate seconds per date and print totals
-  printf '%s' "$pairs" | sort | awk '
+  printf '%s' "$pairs" | awk '
     { sum[$1] += $2; grand += $2; if (!seen[$1]++) dates[++n] = $1 }
     END {
       for (i = 1; i <= n; i++) {
@@ -374,7 +375,7 @@ case "${1:-}" in
 
   get-checking-records) shift; cmd_get_checking_records "$@" ;;
   get-checking-state) cmd_get_checking_state ;;
-  get-hours) cmd_get_hours ;;
+  get-hours) shift; cmd_get_hours "$@" ;;
 
   do-checkin) cmd_checkin ;;
   do-checkout) cmd_checkout ;;
@@ -387,7 +388,7 @@ Commands:
 
   frappe get-checking-records [limit]
   frappe get-checking-state
-  frappe get-hours
+  frappe get-hours [limit]
 
   frappe do-checkin
   frappe do-checkout
