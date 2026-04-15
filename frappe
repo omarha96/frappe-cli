@@ -275,6 +275,18 @@ cmd_get_checking_records() {
 # DO CHECKIN / CHECKOUT
 # ─────────────────────────────────────────────
 
+get_employee_id() {
+  local res
+  res=$(frappe_request \
+    "$FRAPPE_HOST/api/resource/Employee" \
+    -G \
+    --data-urlencode 'fields=["name"]' \
+    --data-urlencode "filters=[[\"user_id\",\"=\",\"$FRAPPE_USERNAME\"]]" \
+    --data-urlencode "limit_page_length=1"
+  )
+  echo "$res" | jq -r '.data[0].name // empty'
+}
+
 do_log() {
   local type="$1"
 
@@ -282,17 +294,22 @@ do_log() {
 
   log "Sending $type..."
 
-  # Try the HRMS app path (ERPNext v14+); fall back to legacy erpnext.hr path
-  local endpoint="$FRAPPE_HOST/api/method/hrms.hr.doctype.employee_checkin.employee_checkin.add_log_based_on_employee_field"
-  local res
-  res=$(frappe_request "$endpoint" -X POST --data-urlencode "log_type=$type")
-
-  if echo "$res" | jq -e '.exc_type? == "ValidationError"' > /dev/null 2>&1 && \
-     echo "$res" | grep -q "No module named 'hrms'"; then
-    log "HRMS module not found, trying legacy ERPNext HR path..."
-    endpoint="$FRAPPE_HOST/api/method/erpnext.hr.doctype.employee_checkin.employee_checkin.add_log_based_on_employee_field"
-    res=$(frappe_request "$endpoint" -X POST --data-urlencode "log_type=$type")
+  local emp_id
+  emp_id=$(get_employee_id)
+  if [[ -z "$emp_id" ]]; then
+    fail "No Employee record found for user '$FRAPPE_USERNAME'. Ensure an Employee with user_id='$FRAPPE_USERNAME' exists in the system."
   fi
+
+  local now
+  now=$(date '+%Y-%m-%d %H:%M:%S')
+
+  local res
+  res=$(frappe_request \
+    "$FRAPPE_HOST/api/resource/Employee%20Checkin" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -d "{\"data\": {\"employee\": \"$emp_id\", \"log_type\": \"$type\", \"time\": \"$now\"}}"
+  )
 
   echo "$res" | jq .
 }
