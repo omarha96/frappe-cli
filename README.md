@@ -187,10 +187,10 @@ frappe do-checkout
 ### 🔹 Calculate worked hours
 
 ```bash
-frappe get-hours
+frappe get-hours [limit]
 ```
 
-Outputs total duration based on recent check-in/out pairs.
+Outputs each date total duration based on check-in/out pairs, and takes optional "limit".
 
 ---
 
