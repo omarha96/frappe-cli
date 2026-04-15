@@ -366,9 +366,11 @@ cmd_get_checking_state() {
 
   case "$state" in
     IN)
-      local elapsed
+      local completed_secs elapsed total_secs
+      completed_secs=$(get_today_duration)
       elapsed=$(( $(date +%s) - $(to_epoch "$ts") ))
-      print_green "IN  — checked in for $(format_duration $elapsed)"
+      total_secs=$(( completed_secs + elapsed ))
+      print_green "IN  — worked $(format_duration $total_secs) today so far"
       ;;
     OUT)
       local today_secs
