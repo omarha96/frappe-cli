@@ -322,14 +322,14 @@ get_today_duration() {
   res=$(frappe_request \
     "$FRAPPE_HOST/api/resource/Employee%20Checkin" \
     -G \
-    --data-urlencode 'fields=["log_type","creation"]' \
-    --data-urlencode "order_by=creation asc" \
+    --data-urlencode 'fields=["log_type","time"]' \
+    --data-urlencode "filters=[[\"time\",\"like\",\"${today}%\"]]" \
+    --data-urlencode "order_by=time asc" \
     --data-urlencode "limit_page_length=50"
   )
 
   local entries
-  entries=$(echo "$res" | jq -r --arg today "$today" \
-    '.data[] | select(.creation | startswith($today)) | "\(.log_type)|\(.creation)"')
+  entries=$(echo "$res" | jq -r '.data[] | "\(.log_type)|\(.time)"')
 
   local last_in="" total=0 type dt diff
 
@@ -354,14 +354,14 @@ cmd_get_checking_state() {
   res=$(frappe_request \
     "$FRAPPE_HOST/api/resource/Employee%20Checkin" \
     -G \
-    --data-urlencode 'fields=["log_type","creation"]' \
-    --data-urlencode "order_by=creation desc" \
+    --data-urlencode 'fields=["log_type","time"]' \
+    --data-urlencode "order_by=time desc" \
     --data-urlencode "limit_page_length=1"
   )
 
   local state ts
   state=$(echo "$res" | jq -r '.data[0].log_type // empty')
-  ts=$(echo "$res" | jq -r '.data[0].creation // empty')
+  ts=$(echo "$res" | jq -r '.data[0].time // empty')
   ts="${ts%%.*}"
 
   case "$state" in
